@@ -1,0 +1,10 @@
+crewai>=0.80.0
+python-telegram-bot>=20.0
+anthropic>=0.40.0
+yfinance>=0.2.50
+yahoo_fin>=0.8.9.1
+lxml_html_clean>=0.4.4    # required by requests_html (yahoo_fin dep) on lxml>=5
+websockets>=13.0,<15.1    # pins away from pyppeteer's <11 conflict
+streamlit>=1.40.0
+python-dotenv>=1.0.0
+pandas>=2.0.0

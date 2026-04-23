@@ -1,0 +1,8 @@
+.env
+catalyst_alpha.db
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db-journal
