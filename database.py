@@ -3,10 +3,11 @@ database.py — Catalyst Alpha v1.0
 SQLite schema initialization and all CRUD helpers.
 """
 
+import os
 import sqlite3
 from datetime import datetime, date, timedelta
 
-DB_PATH = "catalyst_alpha.db"
+DB_PATH = os.environ.get("DB_PATH", "catalyst_alpha.db")
 
 
 # ─── Connection ───────────────────────────────────────────────────────────────
