@@ -259,6 +259,69 @@ st.markdown(
     a.pred-ticker:hover { color: var(--accent-hov) !important; text-decoration: none !important; border-bottom: 1px solid var(--accent-hov); }
     .pred-meta { color: var(--text-muted); font-size: 0.8125rem; margin-top: 2px; }
 
+    /* ── Google Finance–style horizontal quote strip ── */
+    .gf-strip-scroll {
+        display: flex;
+        flex-direction: row;
+        flex-wrap: nowrap;
+        gap: 10px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 4px 2px 14px 2px;
+        scroll-snap-type: x proximity;
+        -webkit-overflow-scrolling: touch;
+    }
+    .gf-mini-card {
+        flex: 0 0 auto;
+        scroll-snap-align: start;
+        min-width: 156px;
+        max-width: 188px;
+        background: #F8F9FA;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px 14px;
+        text-decoration: none !important;
+        color: inherit;
+        box-shadow: var(--shadow-sm);
+        transition: box-shadow 0.15s ease, border-color 0.15s ease;
+    }
+    .gf-mini-card:hover {
+        box-shadow: var(--shadow-md);
+        border-color: #BDC1C6;
+    }
+    .gf-mini-name {
+        font-weight: 700;
+        font-size: 0.94rem;
+        color: var(--text-main);
+        letter-spacing: -0.02em;
+        font-family: var(--mono);
+    }
+    .gf-mini-date {
+        font-size: 0.68rem;
+        color: var(--text-muted);
+        margin-top: 3px;
+    }
+    .gf-mini-table {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 3px 10px;
+        align-items: baseline;
+        margin-top: 10px;
+        font-family: var(--mono);
+        font-size: 0.74rem;
+    }
+    .gf-mini-lbl {
+        color: var(--text-muted);
+        font-weight: 500;
+        font-size: 0.62rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .gf-strip-pos { color: var(--green); font-weight: 600; }
+    .gf-strip-neg { color: var(--red); font-weight: 600; }
+    .gf-strip-zero { color: var(--text-sub); font-weight: 500; }
+    .gf-strip-pend { color: var(--text-muted); font-weight: 400; font-size: 0.68rem; }
+
     .tag-hit {
         background: var(--green-bg);
         color: var(--green);
@@ -788,6 +851,151 @@ def _google_finance_url(ticker: str) -> str:
     return f"https://www.google.com/finance/quote/{path}?hl=he&gl=il"
 
 
+def _prepare_strip_latest_per_ticker(df_p: pd.DataFrame) -> pd.DataFrame:
+    """Collapse to one row per ticker — keep the most recent recommendation."""
+    df = df_p.copy()
+    df["_rd"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["_tuk"] = df["Ticker"].astype(str).str.strip().str.upper()
+    df = df.sort_values(
+        ["_rd", "_tuk"],
+        ascending=[False, True],
+        na_position="last",
+        kind="mergesort",
+    )
+    df = df.drop_duplicates(subset=["_tuk"], keep="first").reset_index(drop=True)
+    return df.drop(columns=["_tuk"])
+
+
+def _strip_cell_pct_html(num, pend_text: str) -> str:
+    """Format a return % for the strip, or pending label when `num` is None."""
+    if num is None or (isinstance(num, float) and pd.isna(num)):
+        return f'<span class="gf-strip-pend">{html.escape(pend_text)}</span>'
+    v = float(num)
+    cls = "gf-strip-pos" if v > 0 else ("gf-strip-neg" if v < 0 else "gf-strip-zero")
+    return f'<span class="{cls}">{v:+.1f}%</span>'
+
+
+def _strip_eod_html(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '<span class="gf-strip-pend">⏳</span>'
+    v = float(val)
+    cls = "gf-strip-pos" if v > 0 else ("gf-strip-neg" if v < 0 else "gf-strip-zero")
+    return f'<span class="{cls}">{v:+.1f}%</span>'
+
+
+def _render_gf_quote_strip(df_latest: pd.DataFrame, date_key: str, today_d: _date) -> None:
+    """Horizontal, Finance-style strip: ticker + EOD / T+3 / T+7 / T+14 / T+30."""
+    st.markdown(
+        '<p class="section-label">Quote strip · latest pick per symbol</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Scroll horizontally · Default = **most recently recommended** first · "
+        "These controls apply only to this strip (main **Sort** row affects the list below)."
+    )
+    t_strip_a, t_strip_b = st.columns([1.15, 0.95], gap="small")
+    with t_strip_a:
+        strip_metric = st.selectbox(
+            "Strip sort",
+            [
+                "Last recommended",
+                "Recommendation date",
+                "EOD %",
+                "T+3",
+                "T+7",
+                "T+14",
+                "T+30",
+            ],
+            index=0,
+            key=f"{date_key}_strip_metric",
+            label_visibility="collapsed",
+            help=(
+                "Order strip cards (one card per ticker = latest recommendation). "
+                "\"Last recommended\" = newest pick date first."
+            ),
+        )
+    with t_strip_b:
+        strip_ord_disabled = strip_metric == "Last recommended"
+        st.selectbox(
+            "Strip order",
+            ["High to low", "Low to high"],
+            index=0,
+            key=f"{date_key}_strip_order",
+            label_visibility="collapsed",
+            disabled=strip_ord_disabled,
+            help="Dates: High = newest first. Returns: High = larger % first.",
+        )
+
+    strip_ord = st.session_state.get(f"{date_key}_strip_order", "High to low")
+    df_sl = df_latest.copy()
+    if "_rd" not in df_sl.columns:
+        df_sl["_rd"] = pd.to_datetime(df_sl["Date"], errors="coerce")
+
+    metric_to_col = {
+        "Last recommended": "_rd",
+        "Recommendation date": "_rd",
+        "EOD %": "EOD Change %",
+        "T+3": "Return 3D",
+        "T+7": "Return 7D",
+        "T+14": "Return 14D",
+        "T+30": "Return 30D",
+    }
+    scol = metric_to_col[strip_metric]
+    if strip_metric == "Last recommended":
+        asc = False
+    else:
+        asc = strip_ord == "Low to high"
+    df_sl = df_sl.sort_values(
+        by=scol,
+        ascending=asc,
+        na_position="last",
+        kind="mergesort",
+    )
+
+    cards: list[str] = ['<div class="gf-strip-scroll">']
+    for _, row in df_sl.iterrows():
+        try:
+            rec_date = _date.fromisoformat(str(row["Date"]))
+        except (TypeError, ValueError):
+            rec_date = today_d
+        days_elapsed = (today_d - rec_date).days
+        tkr = str(row["Ticker"]).strip().upper()
+        g_url = html.escape(_google_finance_url(tkr), quote=True)
+
+        eod_h = _strip_eod_html(row["EOD Change %"])
+
+        s3, n3 = _fmt_return(row["Return 3D"], days_elapsed, 3)
+        s7, n7 = _fmt_return(row["Return 7D"], days_elapsed, 7)
+        s14, n14 = _fmt_return(row["Return 14D"], days_elapsed, 14)
+        s30, n30 = _fmt_return(row["Return 30D"], days_elapsed, 30)
+        r3_h = _strip_cell_pct_html(n3, s3)
+        r7_h = _strip_cell_pct_html(n7, s7)
+        r14_h = _strip_cell_pct_html(n14, s14)
+        r30_h = _strip_cell_pct_html(n30, s30)
+
+        cards.append(
+            f'<a class="gf-mini-card" href="{g_url}" target="_blank" rel="noopener noreferrer">'
+            f'<div class="gf-mini-name">{html.escape(tkr)}</div>'
+            f'<div class="gf-mini-date">{html.escape(str(row["Date"]))}</div>'
+            '<div class="gf-mini-table">'
+            '<span class="gf-mini-lbl">EOD</span>'
+            f"{eod_h}"
+            '<span class="gf-mini-lbl">+3</span>'
+            f"{r3_h}"
+            '<span class="gf-mini-lbl">+7</span>'
+            f"{r7_h}"
+            '<span class="gf-mini-lbl">+14</span>'
+            f"{r14_h}"
+            '<span class="gf-mini-lbl">+30</span>'
+            f"{r30_h}"
+            "</div>"
+            "</a>"
+        )
+    cards.append("</div>")
+    st.markdown("".join(cards), unsafe_allow_html=True)
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
+
+
 def _render_predictions(
     strategy: str,
     label: str,
@@ -827,6 +1035,10 @@ def _render_predictions(
         "Price at pick", "Return session", "Target $",
     ):
         df_p[col] = pd.to_numeric(df_p[col], errors="coerce")
+
+    _today_strip = _date.today()
+    df_strip_latest = _prepare_strip_latest_per_ticker(df_p)
+    _render_gf_quote_strip(df_strip_latest, date_key, _today_strip)
 
     # Derived: target upside %  = (target − pick) / pick · 100  (NaN if either missing)
     _pick_num   = pd.to_numeric(df_p["Price at pick"], errors="coerce")
