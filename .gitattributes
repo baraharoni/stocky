@@ -1,0 +1,2 @@
+# Bash must use LF inside Linux containers (CRLF breaks `set -e` etc.).
+*.sh text eol=lf

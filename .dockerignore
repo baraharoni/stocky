@@ -1,9 +1,12 @@
 .env
-.sim_cache/
+.env.*
 catalyst_alpha.db
+*.db-journal
+.sim_cache/
 __pycache__/
 *.pyc
-*.pyo
 .venv/
 venv/
-*.db-journal
+.git/
+.gitignore
+*.md

@@ -4,6 +4,7 @@ Defines all 5 CrewAI agents, their tools, tasks, and assembled Crews.
 """
 
 import os
+import re
 import json
 import requests
 import yfinance as yf
@@ -21,7 +22,7 @@ load_dotenv()
 # ─── LLM ──────────────────────────────────────────────────────────────────────
 
 claude_llm = LLM(
-    model=os.getenv("LLM_MODEL", "anthropic/claude-3-haiku-20240307"),
+    model=os.getenv("LLM_MODEL", "anthropic/claude-haiku-4-5"),
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
 )
 
@@ -492,6 +493,211 @@ def read_manager_feedback(keywords: str) -> str:
     return json.dumps({"keywords_searched": keyword_list, "feedback": feedback})
 
 
+@tool("Read Recent Picks Performance")
+def read_recent_picks_performance(days_back: str) -> str:
+    """
+    Returns the agent's OWN recent stock picks together with their realised
+    performance, so the morning Analyst can self-review BEFORE recommending
+    today's picks. This is the self-improvement memory: every pick made in the
+    last `days_back` days is shown with what actually happened — not just the
+    ones the EOD Manager has already reviewed.
+
+    For each pick the tool returns:
+      date | ticker | strategy | conf | session | EOD | T+3 | T+7 | T+14 |
+      T+30 | target | target_hit_date | rationale | manager_feedback
+
+    It also returns a 'summary' object with:
+      • total_picks, with_eod_data
+      • n_hits_eod_>=6%, n_misses_eod_<=-3%
+      • n_target_hit, n_target_missed_30d
+      • avg_eod_change, avg_return_7d
+      • top_winners / top_losers (up to 5 each)
+      • confidence_calibration: avg return per confidence band — tells you
+        whether your >=0.80 picks actually outperformed your <0.60 picks
+      • instruction: how to apply these insights to today's picks
+
+    Input:
+      days_back : string-encoded int. Use '5' to inspect the last 5 trading
+                  days, '14' (default) for two weeks, '30' for a month.
+                  Clamped to [1, 60].
+    """
+    try:
+        n = int((days_back or "14").strip())
+    except (ValueError, AttributeError):
+        n = 14
+    n = max(1, min(60, n))
+
+    rows = db.get_recent_predictions_performance(days_back=n, limit=200)
+    if not rows:
+        return json.dumps({
+            "window": f"last {n} days",
+            "total_picks": 0,
+            "summary": (
+                "No prior picks in this window — first run, or DB is empty. "
+                "Proceed without historical bias and rely on Manager feedback "
+                "and external signals only."
+            ),
+            "picks": [],
+        })
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _fmt_pct(v):
+        x = _f(v)
+        return f"{x:+.1f}%" if x is not None else "—"
+
+    picks: list[dict] = []
+    for r in rows:
+        rationale = (r.get("pm_rationale") or "").strip().replace("\n", " ")
+        if len(rationale) > 110:
+            rationale = rationale[:108] + "…"
+        feedback = (r.get("manager_feedback") or "").strip().replace("\n", " ")
+        if len(feedback) > 110:
+            feedback = feedback[:108] + "…"
+        target = _f(r.get("target_price"))
+        conf = _f(r.get("confidence_score"))
+
+        picks.append({
+            "date":       r.get("date"),
+            "ticker":     r.get("ticker"),
+            "strategy":   r.get("strategy") or "alpha",
+            "conf":       f"{conf:.2f}" if conf is not None else "—",
+            "session":    _fmt_pct(r.get("return_session")),
+            "eod":        _fmt_pct(r.get("actual_eod_change")),
+            "T+3":        _fmt_pct(r.get("return_3d")),
+            "T+7":        _fmt_pct(r.get("return_7d")),
+            "T+14":       _fmt_pct(r.get("return_14d")),
+            "T+30":       _fmt_pct(r.get("return_30d")),
+            "target":     f"${target:.2f}" if target is not None else "—",
+            "target_hit": r.get("target_hit_date") or "—",
+            "rationale":  rationale,
+            "feedback":   feedback or "(no EOD review yet)",
+        })
+
+    eod_vals = [v for v in (_f(r.get("actual_eod_change")) for r in rows) if v is not None]
+    r7_vals  = [v for v in (_f(r.get("return_7d"))         for r in rows) if v is not None]
+
+    n_hits_eod      = sum(1 for v in eod_vals if v >= 6.0)
+    n_misses_eod    = sum(1 for v in eod_vals if v <= -3.0)
+    n_target_hit    = sum(
+        1 for r in rows
+        if r.get("target_hit_date") and r.get("target_hit_date") not in ("MISSED", "")
+    )
+    n_target_missed = sum(1 for r in rows if r.get("target_hit_date") == "MISSED")
+
+    avg_eod = round(sum(eod_vals) / len(eod_vals), 2) if eod_vals else None
+    avg_r7  = round(sum(r7_vals)  / len(r7_vals),  2) if r7_vals  else None
+
+    def _best_known(r):
+        for k in ("return_7d", "return_3d", "actual_eod_change"):
+            v = _f(r.get(k))
+            if v is not None:
+                return v
+        return None
+
+    scored = [(r, _best_known(r)) for r in rows]
+    scored = [(r, v) for r, v in scored if v is not None]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_winners = [
+        f"{r['date']} {r['ticker']} ({r.get('strategy', 'alpha')}): {v:+.1f}%"
+        for r, v in scored[:5] if v > 0
+    ]
+    top_losers = [
+        f"{r['date']} {r['ticker']} ({r.get('strategy', 'alpha')}): {v:+.1f}%"
+        for r, v in reversed(scored[-5:]) if v < 0
+    ]
+
+    bands: dict[str, list[float]] = {
+        "high (>=0.80)":   [],
+        "med (0.60-0.79)": [],
+        "low (<0.60)":     [],
+    }
+    for r, v in scored:
+        c = _f(r.get("confidence_score"))
+        if c is None:
+            continue
+        if c >= 0.80:
+            bands["high (>=0.80)"].append(v)
+        elif c >= 0.60:
+            bands["med (0.60-0.79)"].append(v)
+        else:
+            bands["low (<0.60)"].append(v)
+    calibration = {
+        band: {
+            "n":          len(vals),
+            "avg_return": round(sum(vals) / len(vals), 2) if vals else None,
+        }
+        for band, vals in bands.items()
+    }
+
+    summary = {
+        "window":               f"last {n} days",
+        "total_picks":          len(rows),
+        "with_eod_data":        len(eod_vals),
+        "n_hits_eod_>=6%":      n_hits_eod,
+        "n_misses_eod_<=-3%":   n_misses_eod,
+        "n_target_hit":         n_target_hit,
+        "n_target_missed_30d":  n_target_missed,
+        "avg_eod_change":       avg_eod,
+        "avg_return_7d":        avg_r7,
+        "top_winners":          top_winners,
+        "top_losers":           top_losers,
+        "confidence_calibration": calibration,
+        "instruction": (
+            "Use this self-analysis to BIAS today's picks: "
+            "(1) If a sector / catalyst type / sympathy chain shows up in "
+            "    'top_winners' multiple times, look for analogous setups today "
+            "    and start with a +0.05 confidence bonus. "
+            "(2) If a pattern shows up in 'top_losers', either skip it or "
+            "    require a much stronger thesis. "
+            "(3) Compare the 'high' vs 'low' confidence bands — if your high-"
+            "    confidence picks underperformed, tighten today's confidence "
+            "    ceiling (do not exceed 0.78 unless evidence is overwhelming). "
+            "(4) For each ticker you are about to recommend AGAIN, check if it "
+            "    appears in 'picks' — if you already recommended it within the "
+            "    last 5 days and it failed to move, demand a NEW catalyst "
+            "    before re-listing. If it ALREADY hit its target, do not "
+            "    re-recommend (chasing tops is a hard rule)."
+        ),
+    }
+
+    return json.dumps({"summary": summary, "picks": picks}, default=str)
+
+
+def _price_at_pick_from_metrics(metrics: dict | None) -> float | None:
+    """Parse numeric price from the optional metrics dict (e.g. '$4.20' or 4.2)."""
+    if not metrics:
+        return None
+    raw = metrics.get("Price")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).replace(",", "")
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except ValueError:
+        return None
+
+
+def _fetch_last_price(ticker: str) -> float | None:
+    """Last regular close/print from a short yfinance history (at save time)."""
+    try:
+        h = yf.Ticker(ticker).history(period="5d")
+        if h.empty:
+            return None
+        return float(h["Close"].iloc[-1])
+    except Exception:
+        return None
+
+
 @tool("Save Alpha Predictions to Database")
 def save_predictions_to_db(predictions_json: str) -> str:
     """
@@ -500,26 +706,204 @@ def save_predictions_to_db(predictions_json: str) -> str:
       - ticker         (string)  : stock symbol
       - pm_rationale   (string)  : PM agent's approval rationale
       - confidence_score (float) : probability 0.0 – 1.0
+      - target_price   (float, optional) : analyst's sell target in USD.
+                       Must be strictly above pick price and at most 5x pick.
+                       Out-of-range or non-numeric values are silently dropped.
     Returns a confirmation string.
     """
     try:
         data = json.loads(predictions_json)
         preds: list[dict] = data if isinstance(data, list) else data.get("predictions", [])
         today = datetime.now().strftime("%Y-%m-%d")
-        saved: list[str] = []
+
+        # ── Deduplicate within this batch ───────────────────────────────────────
+        # Group by (UPPER ticker, strategy). If the same name shows up multiple
+        # times, merge rationales as bullet points, keep the MAX confidence,
+        # take the MAX target_price (most ambitious sell target wins), and
+        # shallow-merge every metrics key (later picks fill missing keys).
+        merged: dict[tuple[str, str], dict] = {}
         for p in preds:
+            tkr = str(p.get("ticker", "")).strip().upper()
+            if not tkr:
+                continue
+            strat = str(p.get("strategy", "alpha")).strip().lower() or "alpha"
+            key = (tkr, strat)
+
             raw_metrics = p.get("metrics")
             metrics_dict = raw_metrics if isinstance(raw_metrics, dict) else None
-            db.insert_prediction(
-                date=today,
-                ticker=str(p["ticker"]).upper(),
-                pm_rationale=str(p.get("pm_rationale", "")),
-                confidence_score=float(p.get("confidence_score", 0.5)),
-                strategy=str(p.get("strategy", "alpha")),
-                metrics_dict=metrics_dict,
+            try:
+                conf = float(p.get("confidence_score", 0.5))
+            except (TypeError, ValueError):
+                conf = 0.5
+            rationale = str(p.get("pm_rationale", "") or "").strip()
+
+            # Sell target (analyst's "I'd sell here" price) — optional, must be > 0.
+            target_price: float | None = None
+            tp_raw = p.get("target_price")
+            if tp_raw is not None:
+                try:
+                    tp_val = float(tp_raw)
+                    if tp_val > 0:
+                        target_price = tp_val
+                except (TypeError, ValueError):
+                    target_price = None
+
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = {
+                    "ticker": tkr,
+                    "strategy": strat,
+                    "confidence_score": conf,
+                    "rationales": [rationale] if rationale else [],
+                    "metrics": dict(metrics_dict) if metrics_dict else {},
+                    "target_price": target_price,
+                }
+            else:
+                cur["confidence_score"] = max(cur["confidence_score"], conf)
+                if rationale and rationale not in cur["rationales"]:
+                    cur["rationales"].append(rationale)
+                if metrics_dict:
+                    for mk, mv in metrics_dict.items():
+                        if mk not in cur["metrics"] or cur["metrics"][mk] in (None, "", []):
+                            cur["metrics"][mk] = mv
+                if target_price is not None:
+                    cur["target_price"] = (
+                        target_price if cur["target_price"] is None
+                        else max(cur["target_price"], target_price)
+                    )
+
+        # ── Merge against any rows already in DB for the same day ────────────
+        # Prevents inserting a second row when an earlier batch (or a re-run)
+        # already wrote this ticker today. We mutate the existing row instead
+        # of inserting another, so the dashboard shows a single consolidated
+        # entry that retains every historical data point (returns, manager
+        # feedback, EOD, session, metrics).
+        existing_today: dict[tuple[str, str], dict] = {}
+        try:
+            _conn = db.get_connection()
+            _cur = _conn.execute(
+                """
+                SELECT id, ticker, strategy, pm_rationale, confidence_score, metrics,
+                       target_price
+                FROM alpha_predictions
+                WHERE date = ?
+                """,
+                (today,),
             )
-            saved.append(p["ticker"])
-        return f"Saved {len(saved)} predictions for {today}: {', '.join(saved)}"
+            for r in _cur.fetchall():
+                row = dict(r)
+                t = (row.get("ticker") or "").strip().upper()
+                s = (row.get("strategy") or "alpha").strip().lower() or "alpha"
+                if t:
+                    existing_today.setdefault((t, s), row)
+            _conn.close()
+        except Exception:
+            existing_today = {}
+
+        saved: list[str] = []
+        for (_tkr, _strat), m in merged.items():
+            rats = m["rationales"]
+            if len(rats) > 1:
+                pm_rationale = "Multi-reason pick:\n- " + "\n- ".join(rats)
+            elif rats:
+                pm_rationale = rats[0]
+            else:
+                pm_rationale = ""
+
+            metrics_dict = m["metrics"] or None
+            price_at = _price_at_pick_from_metrics(metrics_dict)
+            if price_at is None:
+                price_at = _fetch_last_price(m["ticker"])
+
+            target_price = m.get("target_price")
+            # Reject obviously-broken targets (must sit strictly above pick price
+            # and at most 5x — anything else is a hallucination, not a target).
+            if target_price is not None and price_at is not None:
+                try:
+                    pp = float(price_at)
+                    if not (pp > 0 and pp < target_price <= pp * 5.0):
+                        target_price = None
+                except (TypeError, ValueError):
+                    target_price = None
+
+            # If a row already exists for (ticker, strategy, today), update it
+            # in-place and merge metrics + rationale + max confidence — never
+            # create a duplicate that the user will see on the dashboard.
+            existing = existing_today.get((m["ticker"], m["strategy"]))
+            if existing is not None:
+                existing_metrics = {}
+                blob = existing.get("metrics")
+                if blob:
+                    try:
+                        parsed = json.loads(blob) if isinstance(blob, str) else blob
+                        if isinstance(parsed, dict):
+                            existing_metrics = parsed
+                    except Exception:
+                        existing_metrics = {}
+                if metrics_dict:
+                    for mk, mv in metrics_dict.items():
+                        if mk not in existing_metrics or existing_metrics[mk] in (None, "", []):
+                            existing_metrics[mk] = mv
+
+                existing_rationale = (existing.get("pm_rationale") or "").strip()
+                if existing_rationale and pm_rationale and existing_rationale != pm_rationale:
+                    if existing_rationale not in pm_rationale:
+                        pm_rationale = (
+                            "Multi-reason pick:\n- "
+                            + "\n- ".join([existing_rationale, *rats])
+                        )
+                elif existing_rationale and not pm_rationale:
+                    pm_rationale = existing_rationale
+
+                merged_conf = max(
+                    float(existing.get("confidence_score") or 0.0),
+                    float(m["confidence_score"]),
+                )
+
+                # Existing target wins unless the new one is more ambitious.
+                existing_target = existing.get("target_price")
+                if existing_target is None:
+                    final_target = target_price
+                elif target_price is None:
+                    final_target = existing_target
+                else:
+                    final_target = max(float(existing_target), float(target_price))
+
+                conn = db.get_connection()
+                conn.execute(
+                    """
+                    UPDATE alpha_predictions
+                    SET pm_rationale     = ?,
+                        confidence_score = ?,
+                        metrics          = ?,
+                        price_at_pick    = COALESCE(price_at_pick, ?),
+                        target_price     = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        pm_rationale,
+                        merged_conf,
+                        json.dumps(existing_metrics) if existing_metrics else None,
+                        price_at,
+                        final_target,
+                        existing["id"],
+                    ),
+                )
+                conn.commit()
+                conn.close()
+            else:
+                db.insert_prediction(
+                    date=today,
+                    ticker=m["ticker"],
+                    pm_rationale=pm_rationale,
+                    confidence_score=m["confidence_score"],
+                    strategy=m["strategy"],
+                    metrics_dict=metrics_dict,
+                    price_at_pick=price_at,
+                    target_price=target_price,
+                )
+            saved.append(m["ticker"])
+        return f"Saved {len(saved)} unique predictions for {today}: {', '.join(saved)}"
     except Exception as exc:
         return f"ERROR saving predictions: {exc}"
 
@@ -697,9 +1081,18 @@ analyst_agent = Agent(
     backstory=(
         "You are a ruthless, data-driven hedge fund analyst operating in Deep Scan mode. "
         "You receive large candidate lists and are trained to triage them instantly. "
+        "Before EVERY morning's run you first review your OWN recent track record — "
+        "every pick from the last two weeks, with realised session/EOD/T+3/T+7/T+14/"
+        "T+30 returns and target-hit dates. You treat your own performance as the "
+        "single most reliable feedback loop: patterns that just won 3 days ago get a "
+        "small confidence bonus, patterns that just lost get a penalty, and tickers "
+        "you already recommended in the last 5 days are NEVER chased without a fresh "
+        "catalyst (re-listing a stock that already hit your target = chasing the top, "
+        "which is forbidden). "
         "Stage 1 — Rapid Triage (40→8): In under 30 seconds of mental processing, eliminate "
         "anything with a weak or indirect catalyst, marginal volume, or a pattern flagged as "
-        "unreliable by the Manager. You despise fluff and generic summaries. "
+        "unreliable by the Manager OR by your own recent self-review. You despise fluff "
+        "and generic summaries. "
         "Stage 2 — High-Conviction Analysis (8→3-5): For your shortlist, you speak exclusively "
         "in numbers, catalysts, and risk-reward probabilities. You always quote specific market "
         "caps, volume figures, and news headlines. Your outputs read like terse Bloomberg "
@@ -710,7 +1103,7 @@ analyst_agent = Agent(
         "'Early Momentum' (stocks up 3-5% on massive relative volume indicating institutional "
         "accumulation before a major breakout)."
     ),
-    tools=[read_manager_feedback],
+    tools=[read_recent_picks_performance, read_manager_feedback],
     llm=claude_llm,
     verbose=True,
     allow_delegation=False,
@@ -839,13 +1232,39 @@ def _create_morning_tasks() -> list[Task]:
         description=(
             f"Today is {today}. You are The Brain operating in Deep Scan mode.\n"
             "The PM has handed you a list of up to 40 approved candidates.\n"
-            "Follow this exact three-stage workflow:\n\n"
-            "STEP 1 — Query Long-Term Memory:\n"
+            "Follow this exact workflow — STEP 0 is MANDATORY before anything else:\n\n"
+            "STEP 0 — Self-Review (your own recent track record):\n"
+            "  Call 'Read Recent Picks Performance' with days_back='14'.\n"
+            "  This returns EVERY pick you made in the last 14 days, with their\n"
+            "  realised performance: session, EOD, T+3, T+7, T+14, T+30, target_hit_date,\n"
+            "  plus a self-analysis summary (hit rate, avg return, top winners, top\n"
+            "  losers, confidence calibration per band).\n\n"
+            "  You MUST extract the following before proceeding:\n"
+            "  (a) WINNING PATTERNS — list 1–3 catalyst types / sectors / sympathy chains\n"
+            "      that produced your top winners in the last 5–14 days.\n"
+            "  (b) LOSING PATTERNS — list 1–3 patterns that consistently misfired.\n"
+            "  (c) CONFIDENCE CALIBRATION VERDICT — compare 'high (>=0.80)' vs\n"
+            "      'low (<0.60)' avg returns:\n"
+            "      • If high-band UNDERPERFORMED low-band → today's confidence ceiling\n"
+            "        is 0.78. Do NOT exceed it without overwhelming evidence.\n"
+            "      • If high-band beat low-band by >3pp → calibration is healthy,\n"
+            "        proceed normally.\n"
+            "  (d) RE-PICK GUARD — for every PM-approved ticker, check if it appears in\n"
+            "      the last 5 days of your picks. If yes:\n"
+            "        • If it already HIT its target → REJECT. Do not chase a runner.\n"
+            "        • If its T+3/T+7 is positive but no fresh catalyst → REJECT.\n"
+            "        • If it FAILED (return_7d <= -3%) → only re-pick with a NEW,\n"
+            "          materially different catalyst, and apply -0.10 confidence penalty.\n"
+            "  Output a brief 'Self-Review Findings' block (4 short bullets) before\n"
+            "  moving on. These findings drive every later step.\n\n"
+            "STEP 1 — Query Long-Term Memory (Manager feedback):\n"
             "  Call 'Read Manager Feedback from Database' with a comma-separated string of "
             "  keywords drawn from the PM's APPROVED tickers, their sectors (e.g. "
             "  'semiconductor', 'software', 'EV'), and catalyst types (e.g. 'earnings', "
             "  'sympathy', 'macro', 'upgrade'). Study every returned feedback row for Hard "
-            "  Rules, recurring failures, and reliable sympathy pairs.\n\n"
+            "  Rules, recurring failures, and reliable sympathy pairs.\n"
+            "  Combine these older Hard Rules with the FRESH self-review findings from\n"
+            "  STEP 0 — recent self-review wins on conflict (it reflects current regime).\n\n"
             "STEP 2 — Deduplication & Catalyst Merge (MANDATORY):\n"
             "  Before any triage, scan the full candidate list for duplicate tickers.\n"
             "  A ticker is a duplicate if it appears in BOTH the Earnings Calendar section\n"
@@ -872,7 +1291,14 @@ def _create_morning_tasks() -> list[Task]:
             "  • Technical Setup    : is the price action constructive (gap-up, volume surge)?\n"
             "  • Liquidity Score    : does volume support institutional participation?\n"
             "  Average the four scores, divide by 10 → raw confidence_score (0.0–1.0).\n"
-            "  Then apply Manager lesson adjustments (add/subtract up to 0.10 per Hard Rule).\n\n"
+            "  Then apply adjustments IN THIS ORDER:\n"
+            "    1. Self-Review bonus/penalty (from STEP 0 findings):\n"
+            "         + up to 0.05 if the setup matches a recent WINNING pattern.\n"
+            "         − up to 0.10 if it matches a recent LOSING pattern.\n"
+            "         − 0.10 if RE-PICK GUARD flagged it as a recent failed re-pick.\n"
+            "    2. Manager Hard Rules (STEP 1): ± up to 0.10 per rule.\n"
+            "    3. CAP at the calibration ceiling from STEP 0 (typically 0.78 if the\n"
+            "       high band underperformed; otherwise no extra cap).\n\n"
             "STEP 5 — Final Deduplication Check + Output:\n"
             "  Before writing the JSON, do a final ticker uniqueness scan on your shortlist.\n"
             "  If the same ticker appears more than once (e.g., inherited from two candidate\n"
@@ -880,7 +1306,7 @@ def _create_morning_tasks() -> list[Task]:
             "  confidence_score and discard the other. NEVER output the same ticker twice.\n"
             "  Then output EXACTLY this JSON (3–5 items, all unique tickers):\n"
             '  [{"ticker": "XXXX", "pm_rationale": "Flash note...", '
-            '"confidence_score": 0.XX}, ...]\n\n'
+            '"confidence_score": 0.XX, "target_price": 12.34}, ...]\n\n'
             "RATIONALE RULES (CRITICAL — applies to every pick):\n"
             "FORBIDDEN WORDS: 'attractive', 'solid', 'robust', 'good', 'potential'.\n"
             "MANDATORY FORMAT for pm_rationale:\n"
@@ -890,16 +1316,33 @@ def _create_morning_tasks() -> list[Task]:
             "EXAMPLE (dual catalyst): 'Catalyst: Earnings day (BMO) + pre-market +4.2% surge. "
             "Data: Up 4.2% pre-market on 5.1M volume ($2.3B MktCap). "
             "Setup: Price action pre-confirms beat; dual catalyst adds conviction. "
-            "Manager Note: Applied +0.05 bonus — earnings+momentum combo has 82% hit rate.'"
+            "Manager Note: Applied +0.05 bonus — earnings+momentum combo has 82% hit rate.'\n\n"
+            "TARGET_PRICE RULES (CRITICAL — every pick MUST have one):\n"
+            "  - target_price is an absolute USD price where you would sell.\n"
+            "  - It MUST be strictly above the current/pre-market price visible in the metrics.\n"
+            "  - It MUST be at most 5x the current price (anything higher is rejected as a hallucination).\n"
+            "  - Anchor it to evidence: prior swing high, gap-fill level, IV-implied move, "
+            "    or 1.5–2x the implied daily volatility for swing trades. Typical range is "
+            "    +4% to +25% above pick depending on conviction and float.\n"
+            "  - Higher conviction (>0.80) → more ambitious target; lower conviction → tighter.\n"
+            "  - Round to 2 decimals."
         ),
         expected_output=(
+            "Part 0 — Self-Review Findings (4 short bullets): "
+            "winning patterns (recent), losing patterns (recent), confidence-calibration "
+            "verdict + today's confidence ceiling, and any tickers blocked by the "
+            "RE-PICK GUARD.\n"
             "Part 1 — Dedup Log: list any tickers found in both sections, "
             "showing how their catalysts were merged into one entry.\n"
             "Part 2 — Triage Table: all candidates with keep/cut decisions and one-line reasons.\n"
             "Part 3 — Final JSON array of 3–5 picks (UNIQUE tickers only), each with keys: "
             "ticker (string), pm_rationale (terse flash note, Catalyst/Data/Context format, "
-            "dual catalysts noted where applicable), "
-            "confidence_score (float, 2 decimal places, 0.0–1.0). "
+            "dual catalysts noted where applicable — and explicitly cite the Self-Review "
+            "pattern that justified the bonus or the lesson that capped the score), "
+            "confidence_score (float, 2 decimal places, 0.0–1.0, never above the calibration "
+            "ceiling derived in Part 0), "
+            "target_price (float, USD with 2 decimals — strictly above pick price, "
+            "at most 5x pick price). "
             "Output the raw JSON array last so the Reporter can parse it directly."
         ),
         agent=analyst_agent,
@@ -1257,7 +1700,12 @@ squeeze_agent = Agent(
         "Your output reads like a terse risk desk memo: python_metrics copied verbatim "
         "first, verified news catalyst second, one-sentence thesis last."
     ),
-    tools=[fetch_squeeze_candidates, fetch_earnings_news, save_predictions_to_db],
+    tools=[
+        fetch_squeeze_candidates,
+        fetch_earnings_news,
+        read_recent_picks_performance,
+        save_predictions_to_db,
+    ],
     llm=claude_llm,
     verbose=True,
     allow_delegation=False,
@@ -1290,6 +1738,21 @@ def _create_squeeze_tasks() -> list[Task]:
             "║  into 'metrics' in your output JSON. Do not reconstruct it from         ║\n"
             "║  memory or the display string — use the python_metrics object directly. ║\n"
             "╚══════════════════════════════════════════════════════════════════════════╝\n\n"
+            "STEP 0 — Self-Review (your own recent squeeze track record):\n"
+            "  Call 'Read Recent Picks Performance' with days_back='14'.\n"
+            "  Focus on rows where strategy='squeeze'. Identify:\n"
+            "    • Which past squeeze setups (high RVOL + high short %) actually\n"
+            "      delivered the move — note the catalyst type (earnings beat,\n"
+            "      product launch, FDA approval, etc.).\n"
+            "    • Which faded fast (positive session but T+3 < 0) — these are\n"
+            "      classic 'fake squeezes'; avoid analogous setups today.\n"
+            "    • Whether your high-confidence squeeze picks (>=0.80) actually\n"
+            "      outperformed your low-confidence ones. If not, cap today's\n"
+            "      confidence at 0.78.\n"
+            "    • Any ticker you re-list today that you ALREADY recommended in\n"
+            "      the last 5 days — only repeat if there is a NEW, materially\n"
+            "      different catalyst, otherwise REJECT.\n"
+            "  Output a brief 'Squeeze Self-Review' block (3 bullets) before STEP 1.\n\n"
             "STEP 1 — Quantitative Screen (read-only):\n"
             "  Call 'Fetch Squeeze Candidates' with scan_mode='both'.\n"
             "  The tool returns a JSON object with 'squeeze_candidates' — an array where\n"
@@ -1327,6 +1790,7 @@ def _create_squeeze_tasks() -> list[Task]:
             '      "ticker": "XXX",\n'
             '      "pm_rationale": "<3-line format below>",\n'
             '      "confidence_score": 0.XX,\n'
+            '      "target_price": 12.34,\n'
             '      "strategy": "squeeze",\n'
             '      "metrics": {\n'
             '        "Market Cap":  "<from python_metrics>",\n'
@@ -1346,14 +1810,27 @@ def _create_squeeze_tasks() -> list[Task]:
             "  RATIONALE FORMAT (mandatory, 3 lines):\n"
             "  - Setup: [paste the display string from the tool output for this ticker]\n"
             "  - Catalyst: [exact news headline + date from 'Fetch Earnings News']\n"
-            "  - Thesis: [one sentence on why the squeeze is active today]"
+            "  - Thesis: [one sentence on why the squeeze is active today]\n\n"
+            "  TARGET_PRICE RULES (mandatory):\n"
+            "  - target_price is a USD price where you would close the squeeze position.\n"
+            "  - Read the current Price from python_metrics and set target STRICTLY above it.\n"
+            "  - Cap at 5x current price (anything higher is rejected as hallucination).\n"
+            "  - Squeeze targets are typically aggressive: +10% to +40% on the catalyst day,\n"
+            "    +25% to +80% on multi-day RVOL-driven rotations. Anchor to recent swing highs,\n"
+            "    short-interest levels, or 1.5–2x the 5d range, NOT to thin air.\n"
+            "  - Round to 2 decimals."
         ),
         expected_output=(
+            "Part 0 — Squeeze Self-Review: 3 bullets covering winning patterns, fading "
+            "patterns, and the confidence ceiling derived from past squeeze calibration.\n"
             "Part 1 — Catalyst validation table: ticker | Verified/None Found | headline.\n"
             "Part 2 — JSON array of 3–5 unique confirmed squeeze picks, each with: "
-            "ticker, pm_rationale (Setup/Catalyst/Thesis), confidence_score (0.0–1.0), "
-            "strategy='squeeze', metrics (all 11 fields — 10 verbatim from python_metrics "
-            "plus News='Verified'). Output the raw JSON array last for direct parsing."
+            "ticker, pm_rationale (Setup/Catalyst/Thesis — and explicitly cite the Self-"
+            "Review winner pattern this setup mirrors when applicable), confidence_score "
+            "(0.0–1.0, capped by the Self-Review ceiling), target_price (USD float, "
+            "strictly above current Price, at most 5x current Price), strategy='squeeze', "
+            "metrics (all 11 fields — 10 verbatim from python_metrics plus News='Verified'). "
+            "Output the raw JSON array last for direct parsing."
         ),
         agent=squeeze_agent,
     )
@@ -1369,3 +1846,209 @@ def build_squeeze_crew() -> Crew:
         process=Process.sequential,
         verbose=True,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HISTORICAL TARGET SIMULATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TARGET_SIM_SYSTEM = (
+    "You are a hedge-fund analyst back-simulating sell targets for previously "
+    "made stock picks. You ONLY know the information available at pick time: "
+    "the rationale, the screen metrics and the entry price. You DO NOT and CANNOT "
+    "use any later price action — this is a back-test, future leakage would "
+    "invalidate the simulation. Output ONLY a single JSON object with the key "
+    '"target_price" — nothing else, no prose, no markdown fences.'
+)
+
+
+def _extract_target_from_llm_text(text: str) -> float | None:
+    """Pull a single positive float out of an LLM JSON response, defensively."""
+    if not text:
+        return None
+    s = text.strip()
+    # Strip a leading code fence if the model added one.
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    # First try strict JSON parse.
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            tp = obj.get("target_price")
+            if tp is not None:
+                val = float(tp)
+                if val > 0:
+                    return val
+    except Exception:
+        pass
+    # Fallback: pull the first number that looks like a target.
+    import re
+    m = re.search(r'"target_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', s)
+    if m:
+        try:
+            val = float(m.group(1))
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    m = re.search(r"([0-9]+\.[0-9]+|[0-9]+)", s)
+    if m:
+        try:
+            val = float(m.group(1))
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return None
+
+
+def simulate_historical_targets(
+    *,
+    only_missing: bool = True,
+    dry_run: bool = False,
+    progress: bool = True,
+) -> dict:
+    """
+    Back-simulate analyst sell targets for historical predictions.
+
+    For every prediction (default: only those with target_price IS NULL), call
+    claude_llm with ONLY the context that was visible at pick time and ask for
+    a single target_price. Validate that pick < target <= 5x pick, then UPDATE
+    the row. After all writes, call update_target_hit_dates() so the dashboard
+    immediately knows which targets were ever reached.
+
+    Args:
+        only_missing : if True (default), only rows with NULL target_price.
+        dry_run      : if True, simulate everything but skip DB writes.
+        progress     : if True, print a per-row progress line to stdout.
+
+    Returns:
+        {
+          'scanned'                   : int,   # rows considered
+          'asked'                     : int,   # LLM calls actually issued
+          'written'                   : int,   # rows updated in the DB
+          'rejected_invalid'          : int,   # LLM returned out-of-range value
+          'rejected_no_pick_price'    : int,   # cannot validate without pick price
+          'llm_errors'                : int,   # network / parse failures
+          'hits_resolved'             : int,   # from update_target_hit_dates()
+        }
+    """
+    where = "WHERE price_at_pick IS NOT NULL"
+    if only_missing:
+        where += " AND target_price IS NULL"
+
+    conn = db.get_connection()
+    cur  = conn.execute(
+        f"""
+        SELECT id, date, ticker, strategy, pm_rationale, confidence_score,
+               metrics, price_at_pick, target_price
+        FROM alpha_predictions
+        {where}
+        ORDER BY date ASC, ticker ASC
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    # Also count rows that were skipped because they have no pick price.
+    if only_missing:
+        skip_cur = conn.execute(
+            "SELECT COUNT(*) AS n FROM alpha_predictions "
+            "WHERE target_price IS NULL AND price_at_pick IS NULL"
+        )
+    else:
+        skip_cur = conn.execute(
+            "SELECT COUNT(*) AS n FROM alpha_predictions WHERE price_at_pick IS NULL"
+        )
+    rejected_no_pick_price = int(skip_cur.fetchone()["n"])
+    conn.close()
+
+    asked            = 0
+    written          = 0
+    rejected_invalid = 0
+    llm_errors       = 0
+
+    for i, row in enumerate(rows, 1):
+        try:
+            pick = float(row["price_at_pick"])
+        except (TypeError, ValueError):
+            rejected_no_pick_price += 1
+            continue
+        if pick <= 0:
+            rejected_no_pick_price += 1
+            continue
+
+        prompt = (
+            f"Today is {row['date']} (this is a back-simulation — DO NOT use any "
+            f"information after this date).\n\n"
+            f"Pick: {row['ticker']} @ ${pick:.2f}\n"
+            f"Strategy : {row.get('strategy') or 'alpha'}\n"
+            f"Confidence: {row.get('confidence_score')}\n"
+            f"Rationale: {row.get('pm_rationale') or '(none)'}\n"
+            f"Screen metrics (JSON): {row.get('metrics') or '{}'}\n\n"
+            "Set a SELL TARGET — the absolute USD price where you would close "
+            "this long position for a profit.\n"
+            "Hard rules:\n"
+            f"  1. target_price MUST be strictly above the pick price (${pick:.2f}).\n"
+            f"  2. target_price MUST be at most 5x the pick price (${pick * 5:.2f}).\n"
+            "  3. Anchor the number to evidence in the rationale/metrics: prior swing "
+            "     highs, gap-fill levels, RVOL/short-interest implied moves, or 1.5–2x "
+            "     the implied daily volatility. Typical swing targets are +4% to +25% "
+            "     above pick; squeeze setups can be +10% to +60%.\n"
+            "  4. Higher confidence → more ambitious target.\n"
+            "  5. Round to 2 decimals.\n\n"
+            'Output EXACTLY this JSON (and NOTHING else): {"target_price": <number>}'
+        )
+
+        asked += 1
+        try:
+            raw = claude_llm.call(
+                [{"role": "system", "content": _TARGET_SIM_SYSTEM},
+                 {"role": "user",   "content": prompt}]
+            )
+        except Exception as exc:
+            llm_errors += 1
+            if progress:
+                print(f"  [{i}/{len(rows)}] {row['ticker']} ({row['date']}) "
+                      f"-> LLM error: {exc}")
+            continue
+
+        target = _extract_target_from_llm_text(str(raw or ""))
+        if target is None or not (pick < target <= pick * 5.0):
+            rejected_invalid += 1
+            if progress:
+                snippet = str(raw or "").strip().replace("\n", " ")[:80]
+                print(f"  [{i}/{len(rows)}] {row['ticker']} ({row['date']}) "
+                      f"-> rejected (pick=${pick:.2f}, raw='{snippet}')")
+            continue
+
+        target = round(target, 2)
+        upside = (target - pick) / pick * 100
+        if progress:
+            print(f"  [{i}/{len(rows)}] {row['ticker']:<6} ({row['date']}) "
+                  f"pick=${pick:>7.2f}  target=${target:>7.2f}  (+{upside:5.1f}%)")
+
+        if not dry_run:
+            conn = db.get_connection()
+            conn.execute(
+                "UPDATE alpha_predictions SET target_price = ?, target_hit_date = NULL "
+                "WHERE id = ?",
+                (target, row["id"]),
+            )
+            conn.commit()
+            conn.close()
+            written += 1
+
+    # Always resolve hits after writing — keeps the dashboard consistent.
+    hits = {} if dry_run else db.update_target_hit_dates()
+
+    return {
+        "scanned"                : len(rows),
+        "asked"                  : asked,
+        "written"                : written,
+        "rejected_invalid"       : rejected_invalid,
+        "rejected_no_pick_price" : rejected_no_pick_price,
+        "llm_errors"             : llm_errors,
+        "hits_resolved"          : int(hits.get("hits_written", 0)),
+    }

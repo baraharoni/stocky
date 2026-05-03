@@ -1,7 +1,17 @@
-app = "stocky"
+# App names are globally unique on Fly.io — if deploy fails, pick another.
+app = "bar8-stocky"
 primary_region = "ams"
 
 [build]
+
+[deploy]
+  wait_timeout = "10m"
+
+[env]
+  # Ignored when DATABASE_URL secret is set (Neon Postgres — recommended).
+  DB_PATH = "/data/catalyst_alpha.db"
+  TZ = "Asia/Jerusalem"
+  PYTHONUNBUFFERED = "1"
 
 [http_service]
   internal_port = 8080
@@ -10,11 +20,29 @@ primary_region = "ams"
   auto_start_machines = true
   min_machines_running = 1
 
+  # Streamlit + init_db + deps can take well over 30s on a cold machine.
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "15s"
+    grace_period = "3m"
+    method = "GET"
+    path = "/_stcore/health"
+
 [[vm]]
-  memory = "256mb"
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
 
 [mounts]
   source = "stocky_data"
   destination = "/data"
+
+# First deploy (billing required on fly.io): from repo root run:
+#   winget install Fly-io.flyctl -e
+#   (close terminal, open new one — or use full path %USERPROFILE%\.fly\bin\flyctl.exe)
+#   flyctl auth login
+#   powershell -ExecutionPolicy Bypass -File .\scripts\fly-bootstrap.ps1
+# Optional: copy local DB — fly ssh sftp shell -a bar8-stocky  then  put catalyst_alpha.db /data/catalyst_alpha.db
+# If site shows HTTP 503 / machine max restarts: fix DATABASE_URL then:
+#   powershell -ExecutionPolicy Bypass -File .\scripts\set-fly-database-url.ps1
+#   flyctl deploy -a bar8-stocky --remote-only --wait-timeout 10m

@@ -9,3 +9,5 @@ websockets>=13.0,<15.1    # pins away from pyppeteer's <11 conflict
 streamlit>=1.40.0
 python-dotenv>=1.0.0
 pandas>=2.0.0
+openpyxl>=3.1.0           # multi-sheet .xlsx export from the dashboard
+psycopg[binary]>=3.2.0    # PostgreSQL (Neon, etc.) when DATABASE_URL is set
