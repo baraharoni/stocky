@@ -55,6 +55,14 @@ def _google_finance_url(ticker: str) -> str:
     return f"https://www.google.com/finance/quote/{path}?hl=he&gl=il"
 
 
+def _google_stock_search_url(ticker: str) -> str:
+    sym = str(ticker).strip().upper()
+    if not sym:
+        return "https://www.google.com/search?q=stock"
+    q = urllib.parse.quote_plus(f"{sym} stock")
+    return f"https://www.google.com/search?q={q}"
+
+
 st.set_page_config(
     page_title="Stock – Catalyst Alpha",
     page_icon="📈",
@@ -126,14 +134,17 @@ if not ticker:
 
 rows = get_predictions_by_ticker(ticker)
 g_fin_url = _google_finance_url(ticker)
+g_search_url = _google_stock_search_url(ticker)
 
 render_google_finance_style_widget(ticker, g_fin_url, all_syms)
 
 n = len(rows)
 st.markdown(
     f'<p class="stock-sub">Catalyst history — {n} prediction(s) · '
+    f'<a href="{g_search_url}" target="_blank" rel="noopener noreferrer">'
+    f"Google search ↗</a> · "
     f'<a href="{g_fin_url}" target="_blank" rel="noopener noreferrer">'
-    f"Open in Google Finance ↗</a></p>",
+    f"Google Finance ↗</a></p>",
     unsafe_allow_html=True,
 )
 

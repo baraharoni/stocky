@@ -638,28 +638,28 @@ def _render_manual_pipeline_sidebar() -> None:
             else:
                 st.error(msg)
 
-        with st.expander("פקודות — הרצה ידנית / Manual runs", expanded=False):
-            st.caption(
-                "אותן פעולות כמו מהטרמינל; ההרצה עלולה להימשך כמה דקות "
-                "(LLM). אותו תהליך כמו ב-Fly / `scheduler.py`."
-            )
-            for flag, (label_he, cli_hint) in _MANUAL_PIPELINES.items():
-                key = f"manual_pipe_{flag.strip('-')}"
-                if st.button(label_he, key=key, use_container_width=True):
-                    with st.spinner(f"מריץ {label_he}…"):
-                        rc, out, err = _run_main_pipeline(flag)
-                    tail = (out + "\n" + err)[-8000:]
-                    if rc == 0:
-                        st.session_state["_pipeline_flash"] = (
-                            "ok",
-                            f"{label_he} — הושלם בהצלחה.",
-                        )
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"{label_he} — נכשל (קוד יציאה {rc}).")
-                        st.code(tail.strip() or "(אין פלט / no output)", language="text")
-                        st.caption(cli_hint)
+        st.markdown("### פקודות — הרצה ידנית")
+        st.caption(
+            "הרצה ידנית לכל פקודה (כמו בטרמינל). עלול להימשך כמה דקות (LLM)."
+        )
+        for flag, (label_he, cli_hint) in _MANUAL_PIPELINES.items():
+            key = f"manual_pipe_{flag.strip('-')}"
+            if st.button(label_he, key=key, use_container_width=True):
+                with st.spinner(f"מריץ {label_he}…"):
+                    rc, out, err = _run_main_pipeline(flag)
+                tail = (out + "\n" + err)[-8000:]
+                if rc == 0:
+                    st.session_state["_pipeline_flash"] = (
+                        "ok",
+                        f"{label_he} — הושלם בהצלחה.",
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"{label_he} — נכשל (קוד יציאה {rc}).")
+                    st.code(tail.strip() or "(אין פלט / no output)", language="text")
+                    st.caption(cli_hint)
+        st.divider()
 
 
 def _render_export_section() -> None:
@@ -940,6 +940,15 @@ def _google_finance_url(ticker: str) -> str:
     return f"https://www.google.com/finance/quote/{path}?hl=he&gl=il"
 
 
+def _google_stock_search_url(ticker: str) -> str:
+    """Google web search for the symbol (e.g. ?q=TOWER+stock)."""
+    sym = str(ticker).strip().upper()
+    if not sym:
+        return "https://www.google.com/search?q=stock"
+    q = urllib.parse.quote_plus(f"{sym} stock")
+    return f"https://www.google.com/search?q={q}"
+
+
 def _prepare_strip_latest_per_ticker(df_p: pd.DataFrame) -> pd.DataFrame:
     """Collapse to one row per ticker — keep the most recent recommendation."""
     df = df_p.copy()
@@ -1077,7 +1086,7 @@ def _render_gf_quote_strip(df_latest: pd.DataFrame, date_key: str, today_d: _dat
             rec_date = today_d
         days_elapsed = (today_d - rec_date).days
         tkr = str(row["Ticker"]).strip().upper()
-        g_url = html.escape(_google_finance_url(tkr), quote=True)
+        g_url = html.escape(_google_stock_search_url(tkr), quote=True)
 
         eod_h = _strip_eod_html(row["EOD Change %"])
 
@@ -1448,9 +1457,9 @@ def _render_predictions(
                 help="Add this card to the group (summary of averages is above the list).",
             )
         with h1:
-            g_url = _google_finance_url(tkr)
+            g_url = _google_stock_search_url(tkr)
             st.markdown(
-                f'<a class="pred-ticker" style="text-decoration:none;" href="{g_url}" '
+                f'<a class="pred-ticker" style="text-decoration:none;" href="{html.escape(g_url, quote=True)}" '
                 f'target="_blank" rel="noopener noreferrer">{html.escape(tkr)}</a>',
                 unsafe_allow_html=True,
             )
@@ -1764,7 +1773,7 @@ def _render_predictions(
         show_tbl.insert(
             0,
             "↗",
-            show_tbl["Ticker"].apply(lambda t: _google_finance_url(str(t))),
+            show_tbl["Ticker"].apply(lambda t: _google_stock_search_url(str(t))),
         )
         st.dataframe(
             show_tbl,

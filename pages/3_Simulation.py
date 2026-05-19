@@ -201,6 +201,14 @@ def _google_finance_url(ticker: str) -> str:
     return f"https://www.google.com/finance/quote/{path}?hl=he&gl=il"
 
 
+def _google_stock_search_url(ticker: str) -> str:
+    sym = str(ticker).strip().upper()
+    if not sym:
+        return "https://www.google.com/search?q=stock"
+    q = urllib.parse.quote_plus(f"{sym} stock")
+    return f"https://www.google.com/search?q={q}"
+
+
 def _fmt_pct(val) -> str:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "—"
@@ -649,7 +657,7 @@ else:
             with head_l:
                 st.markdown(
                     f"<span class='sim-rank'>#{int(row.get('pick_rank') or 0)}</span>"
-                    f"<a class='sim-ticker' href='{_google_finance_url(tkr)}' "
+                    f"<a class='sim-ticker' href='{_google_stock_search_url(tkr)}' "
                     f"target='_blank' rel='noopener noreferrer'>"
                     f"{html.escape(tkr)}</a>"
                     f"<div class='sim-meta'>"
