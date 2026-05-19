@@ -8,6 +8,8 @@ Streamlit dashboard with two tabs:
 import hashlib
 import html
 import io
+import subprocess
+import sys
 import urllib.parse
 import zipfile
 
@@ -301,6 +303,38 @@ st.markdown(
         color: var(--text-muted);
         margin-top: 3px;
     }
+    .gf-mini-conf {
+        display: inline-block;
+        margin-top: 6px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 0.66rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        line-height: 1.35;
+        white-space: nowrap;
+    }
+    .gf-mini-conf-hi {
+        background: var(--green-bg);
+        color: var(--green);
+        border: 1px solid #CEEAD6;
+    }
+    .gf-mini-conf-md {
+        background: var(--accent-lt);
+        color: var(--accent);
+        border: 1px solid var(--border-acc);
+    }
+    .gf-mini-conf-lo {
+        background: var(--amber-bg);
+        color: var(--amber);
+        border: 1px solid #FEEFC3;
+    }
+    .gf-mini-conf-na {
+        background: var(--bg-card2);
+        color: var(--text-muted);
+        border: 1px solid var(--border);
+    }
     .gf-mini-table {
         display: grid;
         grid-template-columns: auto 1fr;
@@ -574,6 +608,60 @@ def _build_csv_zip_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
     return buf.getvalue()
 
 
+_MANUAL_PIPELINES: dict[str, tuple[str, str]] = {
+    "--morning": ("בוקר · Alpha morning", "`python main.py --morning`"),
+    "--eod": ("סוף יום · EOD", "`python main.py --eod`"),
+    "--squeeze": ("סקוויז · Squeeze", "`python main.py --squeeze`"),
+}
+
+
+def _run_main_pipeline(flag: str) -> tuple[int, str, str]:
+    """Run main.py with a single whitelisted flag; returns (exit_code, stdout, stderr)."""
+    if flag not in _MANUAL_PIPELINES:
+        raise ValueError(f"disallowed flag: {flag!r}")
+    proc = subprocess.run(
+        [sys.executable, str(_APP_DIR / "main.py"), flag],
+        cwd=str(_APP_DIR),
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _render_manual_pipeline_sidebar() -> None:
+    """Sidebar: buttons to run morning / EOD / squeeze pipelines (same as CLI)."""
+    with st.sidebar:
+        if "_pipeline_flash" in st.session_state:
+            kind, msg = st.session_state.pop("_pipeline_flash")
+            if kind == "ok":
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        with st.expander("פקודות — הרצה ידנית / Manual runs", expanded=False):
+            st.caption(
+                "אותן פעולות כמו מהטרמינל; ההרצה עלולה להימשך כמה דקות "
+                "(LLM). אותו תהליך כמו ב-Fly / `scheduler.py`."
+            )
+            for flag, (label_he, cli_hint) in _MANUAL_PIPELINES.items():
+                key = f"manual_pipe_{flag.strip('-')}"
+                if st.button(label_he, key=key, use_container_width=True):
+                    with st.spinner(f"מריץ {label_he}…"):
+                        rc, out, err = _run_main_pipeline(flag)
+                    tail = (out + "\n" + err)[-8000:]
+                    if rc == 0:
+                        st.session_state["_pipeline_flash"] = (
+                            "ok",
+                            f"{label_he} — הושלם בהצלחה.",
+                        )
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"{label_he} — נכשל (קוד יציאה {rc}).")
+                        st.code(tail.strip() or "(אין פלט / no output)", language="text")
+                        st.caption(cli_hint)
+
+
 def _render_export_section() -> None:
     """Sidebar block: pick a format and download every prediction + movers."""
     with st.sidebar:
@@ -628,6 +716,7 @@ def _render_export_section() -> None:
         st.divider()
 
 
+_render_manual_pipeline_sidebar()
 _render_export_section()
 
 # ─── Header ───────────────────────────────────────────────────────────────────
@@ -883,6 +972,34 @@ def _strip_eod_html(val) -> str:
     return f'<span class="{cls}">{v:+.1f}%</span>'
 
 
+def _strip_conf_html(val) -> str:
+    """Confidence pill for each quote-strip card."""
+    tip = html.escape("Agent confidence at pick time", quote=True)
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return (
+            f'<span class="gf-mini-conf gf-mini-conf-na" title="{tip}">'
+            "Conf —</span>"
+        )
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return (
+            f'<span class="gf-mini-conf gf-mini-conf-na" title="{tip}">'
+            "Conf —</span>"
+        )
+    pct = v * 100.0 if v <= 1.0 else v
+    if pct >= 75.0:
+        cls = "gf-mini-conf-hi"
+    elif pct >= 50.0:
+        cls = "gf-mini-conf-md"
+    else:
+        cls = "gf-mini-conf-lo"
+    return (
+        f'<span class="gf-mini-conf {cls}" title="{tip}">'
+        f"Conf {pct:.0f}%</span>"
+    )
+
+
 def _render_gf_quote_strip(df_latest: pd.DataFrame, date_key: str, today_d: _date) -> None:
     """Horizontal, Finance-style strip: ticker + EOD / T+3 / T+7 / T+14 / T+30."""
     st.markdown(
@@ -972,11 +1089,13 @@ def _render_gf_quote_strip(df_latest: pd.DataFrame, date_key: str, today_d: _dat
         r7_h = _strip_cell_pct_html(n7, s7)
         r14_h = _strip_cell_pct_html(n14, s14)
         r30_h = _strip_cell_pct_html(n30, s30)
+        conf_h = _strip_conf_html(row.get("Confidence"))
 
         cards.append(
             f'<a class="gf-mini-card" href="{g_url}" target="_blank" rel="noopener noreferrer">'
             f'<div class="gf-mini-name">{html.escape(tkr)}</div>'
             f'<div class="gf-mini-date">{html.escape(str(row["Date"]))}</div>'
+            f"{conf_h}"
             '<div class="gf-mini-table">'
             '<span class="gf-mini-lbl">EOD</span>'
             f"{eod_h}"
